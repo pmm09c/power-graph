@@ -700,8 +700,8 @@ def plot_power_profile(consumption_data):
             if details["operation_mode"] == "polled":
                 interval = 3600 / consumption_data.get("base_frequency_per_hour", 60)
                 for t in range(0, seconds, int(interval)):
-                    if t + 100 < seconds:  # 100ms active time
-                        polled_timeline[t:t+100] += details["average_mw"]
+                    end = min(t + 100, seconds)  # 100ms active time
+                    polled_timeline[t:end] += details["average_mw"]
     if np.any(polled_timeline > 0):
         components.append(("Polled Sensors", polled_timeline, 'green'))
     
@@ -709,10 +709,12 @@ def plot_power_profile(consumption_data):
     gps_timeline = np.zeros(seconds)
     if "gps" in consumption_data["communications"]["details"]:
         gps = consumption_data["communications"]["details"]["gps"]
-        interval = int(3600 / gps.get("updates", 24) * hours)
+        interval = int((hours * 3600) / gps.get("updates", 24))
+        duration = int(COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["typical_duration"])
+        
         for t in range(0, seconds, interval):
-            if t + 30 < seconds:  # 30s active time
-                gps_timeline[t:t+30] = COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["power"]
+            end = min(t + duration, seconds)
+            gps_timeline[t:end] += COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["power"]
     if np.any(gps_timeline > 0):
         components.append(("GPS", gps_timeline, 'yellow'))
     
@@ -720,11 +722,12 @@ def plot_power_profile(consumption_data):
     cellular_timeline = np.zeros(seconds)
     if "cellular" in consumption_data["communications"]["details"]:
         cellular = consumption_data["communications"]["details"]["cellular"]
-        interval = int(24 * 3600 / cellular.get("sessions", 1))
+        interval = int((hours * 3600) / cellular.get("sessions", 1))
         duration = int(cellular.get("duration_minutes", 1) * 60)
+        
         for t in range(0, seconds, interval):
-            if t + duration < seconds:
-                cellular_timeline[t:t+duration] = COMMS_CONFIGS["CELLULAR"]["power_modes"]["active"]["power"]
+            end = min(t + duration, seconds)
+            cellular_timeline[t:end] += COMMS_CONFIGS["CELLULAR"]["power_modes"]["active"]["power"]
     if np.any(cellular_timeline > 0):
         components.append(("Cellular", cellular_timeline, 'red'))
     
@@ -735,10 +738,10 @@ def plot_power_profile(consumption_data):
         if lora.get("rx_enabled", False):
             lora_timeline += COMMS_CONFIGS["LORA"]["power_modes"]["rx"]["power"] * lora.get("rx_duty_cycle", 0.1)
         messages_per_day = 24 if lora.get("frequency_type") == "per_hour" else 1
-        interval = int(24 * 3600 / (messages_per_day * lora.get("frequency", 1)))
+        interval = int((hours * 3600) / (messages_per_day * lora.get("frequency", 1)))
         for t in range(0, seconds, interval):
-            if t + 5 < seconds:  # 5s transmission time
-                lora_timeline[t:t+5] = COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["power"]
+            end = min(t + 5, seconds)  # 5s transmission time
+            lora_timeline[t:end] += COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["power"]
     if np.any(lora_timeline > 0):
         components.append(("LoRa", lora_timeline, 'purple'))
     
@@ -746,22 +749,22 @@ def plot_power_profile(consumption_data):
     coprocessor_timeline = np.zeros(seconds)
     if consumption_data["coprocessor"].get("total", 0) > 0:
         coprocessor = consumption_data["coprocessor"]["details"]
-        interval = int(24 * 3600 / coprocessor.get("windows", 1))
-        duration = int(coprocessor.get("duration_minutes", 5) * 60)
+        interval = int((hours * 3600) / coprocessor.get("windows", 1))
+        duration = int(coprocessor.get("duration_minutes", 60) * 60)  # 60 minutes default
         for t in range(0, seconds, interval):
-            if t + duration < seconds:
-                coprocessor_timeline[t:t+duration] = coprocessor.get("average_mw", 0)
+            end = min(t + duration, seconds)
+            coprocessor_timeline[t:end] += coprocessor.get("average_mw", 0)
     if np.any(coprocessor_timeline > 0):
         components.append(("Co-Processor", coprocessor_timeline, 'orange'))
     
     # Plot each component
     bottom = np.zeros(seconds)
     for name, timeline, color in components:
-        # Downsample for plotting (1 point per minute)
-        minutes = np.arange(24*60)
-        minute_data = np.array([np.max(timeline[i*60:(i+1)*60]) for i in range(24*60)])
-        ax.fill_between(minutes/60, bottom[::60], bottom[::60] + minute_data, 
-                       label=name, alpha=0.5, color=color)
+        # Downsample for plotting (average power per minute instead of max)
+        minutes = np.arange(24 * 60)
+        minute_data = np.array([np.mean(timeline[i*60:(i+1)*60]) for i in range(24 * 60)])
+        ax.fill_between(minutes / 60, bottom[::60], bottom[::60] + minute_data, 
+                        label=name, alpha=0.5, color=color)
         bottom[::60] += minute_data
     
     # Add average line
@@ -783,6 +786,7 @@ def plot_power_profile(consumption_data):
     
     plt.tight_layout()
     return fig
+
     
 def plot_power_distribution(consumption_data):
     """Create detailed power distribution visualization."""
