@@ -268,7 +268,7 @@ DEFAULT_PROFILES = {
         }
     },
     "Recommended": {
-        "description": "Optimized power profile with balanced monitoring and processing",
+        "description": "Optimized power profile with balanced monitoring and processing using LoRa and CM4",
         "sensor_config": {
             "LSM6DSV": {
                 "enabled": True,
@@ -306,18 +306,28 @@ DEFAULT_PROFILES = {
                 "frequency_per_day": 24,
                 "duration_minutes": 1
             },
-            "lora": {"enabled": False}
+            "lora": {
+                "enabled": True,
+                "active_power": COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["power"],
+                "frequency_type": "per_hour",
+                "frequency": 1.0,
+                "duration_seconds": COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["typical_duration"],
+                "listen_enabled": True,
+                "rx_duty_cycle": 0.1
+            }
         },
         "coprocessor_config": {
             "enabled": True,
-            "type": "Jetson Orin Nano",
-            "active_power": COPROCESSOR_CONFIGS["Jetson Orin Nano"]["power_modes"]["typical"]["active"],
-            "idle_power": COPROCESSOR_CONFIGS["Jetson Orin Nano"]["power_modes"]["typical"]["idle"],
+            "type": "Raspberry Pi CM4",
+            "power_mode": "typical",  # Added explicit power mode selection
+            "active_power": COPROCESSOR_CONFIGS["Raspberry Pi CM4"]["power_modes"]["typical"]["active"],
+            "idle_power": COPROCESSOR_CONFIGS["Raspberry Pi CM4"]["power_modes"]["typical"]["idle"],
             "frequency_per_day": 4,
             "duration_minutes": 2
         }
     }
 }
+
 # =============================================================================
 # CALCULATION FUNCTIONS
 # =============================================================================
