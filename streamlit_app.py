@@ -542,90 +542,92 @@ def calculate_battery_life(battery_capacity_wh, daily_consumption_mwh):
 
 def calculate_power_timeline(consumption_data, hours=24):
     """Calculate detailed power timeline with all components."""
-    # Initialize timeline with one second resolution
+    # Initialize timeline with one-second resolution
     seconds = hours * 3600
     timeline = np.zeros(seconds)
     
     # 1. Add continuous sensor power (e.g., IMU)
     if consumption_data["sensors"]["continuous"] > 0:
         continuous_power = consumption_data["sensors"]["continuous"] / hours
-        timeline += continuous_power
+        timeline += continuous_power  # Applied evenly across all seconds
     
     # 2. Add polled sensor events
     if "details" in consumption_data["sensors"]:
         for sensor_id, sensor in consumption_data["sensors"]["details"].items():
             if sensor["operation_mode"] == "polled":
-                # Calculate timing
-                interval = 3600 / consumption_data.get("base_frequency_per_hour", 60)
-                duration = consumption_data.get("base_duration_seconds", 0.1)
+                # Calculate timing for each polling event
+                interval = int(3600 / consumption_data.get("base_frequency_per_hour", 60))
+                duration = int(consumption_data.get("base_duration_seconds", 0.1) * 1000)  # Convert to ms
                 
-                # Add sensor active periods
-                for t in range(0, seconds, int(interval)):
-                    if t + duration < seconds:
-                        timeline[int(t):int(t + duration)] += sensor["average_mw"]
+                for t in range(0, seconds, interval):
+                    start = int(t)
+                    end = min(start + duration, seconds)
+                    timeline[start:end] += sensor["average_mw"]
     
     # 3. Add GPS events
     comms_details = consumption_data.get("communications", {}).get("details", {})
     if "gps" in comms_details:
         gps_details = comms_details["gps"]
-        if isinstance(gps_details, dict) and gps_details.get("average_mw"):
-            interval = int(3600 * 24 / gps_details.get("updates", 24))
-            duration = int(COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["typical_duration"])
+        interval = int((hours * 3600) / gps_details.get("updates", 24))
+        duration = int(COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["typical_duration"])
+        
+        for t in range(0, seconds, interval):
+            if t == 0:  # First fix includes acquisition
+                duration = int(COMMS_CONFIGS["GPS"]["power_modes"]["acquisition"]["typical_duration"])
+                power = COMMS_CONFIGS["GPS"]["power_modes"]["acquisition"]["power"]
+            else:
+                power = COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["power"]
             
-            for t in range(0, seconds, interval):
-                if t == 0:  # First fix includes acquisition
-                    timeline[t:t + int(COMMS_CONFIGS["GPS"]["power_modes"]["acquisition"]["typical_duration"])] += \
-                        COMMS_CONFIGS["GPS"]["power_modes"]["acquisition"]["power"]
-                else:  # Regular tracking
-                    if t + duration < seconds:
-                        timeline[int(t):int(t + duration)] += COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["power"]
+            start = int(t)
+            end = min(start + duration, seconds)
+            timeline[start:end] += power
     
     # 4. Add Cellular events
     if "cellular" in comms_details:
         cellular_details = comms_details["cellular"]
-        if isinstance(cellular_details, dict) and cellular_details.get("average_mw"):
-            sessions = cellular_details.get("sessions", 1)
-            interval = int(24 * 3600 / sessions)
-            duration = int(COMMS_CONFIGS["CELLULAR"]["default_schedule"]["duration"] * 60)
-            
-            for t in range(0, seconds, interval):
-                if t + duration < seconds:
-                    # Add startup spike
-                    timeline[t] += COMMS_CONFIGS["CELLULAR"]["power_modes"]["startup"]["power"]
-                    # Add transmission window
-                    timeline[t+1:t+duration] += COMMS_CONFIGS["CELLULAR"]["power_modes"]["active"]["power"]
-    
+        sessions = cellular_details.get("sessions", 1)
+        interval = int((hours * 3600) / sessions)
+        duration = int(cellular_details.get("duration_minutes", 1) * 60)
+        
+        for t in range(0, seconds, interval):
+            start = int(t)
+            end = min(start + duration, seconds)
+            timeline[start:end] += COMMS_CONFIGS["CELLULAR"]["power_modes"]["active"]["power"]
+        
     # 5. Add LoRa events
     if "lora" in comms_details:
         lora_details = comms_details["lora"]
-        if isinstance(lora_details, dict) and lora_details.get("average_mw"):
-            messages = lora_details.get("messages", 24)
-            interval = int(24 * 3600 / messages)
-            duration = int(COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["typical_duration"])
-            
-            for t in range(0, seconds, interval):
-                if t + duration < seconds:
-                    timeline[t:t+duration] += COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["power"]
-            
-            # Add listening power if enabled
-            if lora_details.get("rx_enabled", False):
-                rx_power = COMMS_CONFIGS["LORA"]["power_modes"]["rx"]["power"]
-                timeline += rx_power * lora_details.get("rx_duty_cycle", 0.1)
-    
+        messages = lora_details.get("messages", 24)
+        interval = int((hours * 3600) / messages)
+        duration = int(lora_details.get("duration_seconds", 5))
+        
+        for t in range(0, seconds, interval):
+            start = int(t)
+            end = min(start + duration, seconds)
+            timeline[start:end] += lora_details.get("active_power", 0)
+        
+        # Add listening power if enabled
+        if lora_details.get("rx_enabled", False):
+            rx_power = COMMS_CONFIGS["LORA"]["power_modes"]["rx"]["power"]
+            listen_time = int((hours * 3600) * lora_details.get("rx_duty_cycle", 0.1))
+            for t in range(0, seconds, listen_time):
+                timeline[t:t+listen_time] += rx_power
+                
     # 6. Add Coprocessor events
     if consumption_data["coprocessor"].get("total", 0) > 0:
-        coprocessor_details = consumption_data["coprocessor"].get("details", {})
-        if isinstance(coprocessor_details, dict):
-            windows = coprocessor_details.get("windows", 1)
-            interval = int(24 * 3600 / windows)
-            duration = int(coprocessor_details.get("active_mwh", 0) / 
-                         coprocessor_details.get("average_mw", 1) * 3600)
-            
-            for t in range(0, seconds, interval):
-                if t + duration < seconds:
-                    timeline[t:t+duration] += coprocessor_details.get("average_mw", 0)
+        coprocessor_details = consumption_data["coprocessor"]["details"]
+        windows = int(coprocessor_details.get("windows", 1))  # Number of processing windows
+        interval = int((hours * 3600) / windows)  # Interval between processing windows in seconds
+        duration = int(coprocessor_details.get("duration_minutes", 60) * 60)  # Duration in seconds
+        print(coprocessor_details, seconds, interval, duration, coprocessor_details.get("average_mw", 0))
+        for t in range(0, seconds, interval):
+            start = t  # Start time of the processing window
+            end = min(start + duration, seconds)  # End time, ensuring it doesn't exceed the total timeline
+            timeline[start:end] += coprocessor_details.get("average_mw", 0)  # Apply power continuously
+
     
     return timeline
+
 # =============================================================================
 # VISUALIZATION AND UI FUNCTIONS
 # =============================================================================
