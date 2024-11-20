@@ -769,8 +769,98 @@ def create_battery_section():
         }
     }
 
+def calculate_power_timeline(consumption_data, hours=24):
+    """
+    Calculate detailed power timeline with all components.
+    Returns power values for each second of the day.
+    """
+    # Initialize timeline with one second resolution
+    seconds = hours * 3600
+    timeline = np.zeros(seconds)
+    
+    # 1. Add continuous sensor power (e.g., IMU)
+    if consumption_data["sensors"]["continuous"] > 0:
+        continuous_power = consumption_data["sensors"]["continuous"] / hours
+        timeline += continuous_power
+    
+    # 2. Add polled sensor events
+    if "details" in consumption_data["sensors"]:
+        for sensor_id, sensor in consumption_data["sensors"]["details"].items():
+            if sensor["operation_mode"] == "polled":
+                # Calculate timing
+                interval = 3600 / consumption_data.get("base_frequency_per_hour", 60)
+                duration = consumption_data.get("base_duration_seconds", 0.1)
+                
+                # Add sensor active periods
+                for t in range(0, seconds, int(interval)):
+                    if t + duration < seconds:
+                        timeline[int(t):int(t + duration)] += (sensor["average_mw"])
+    
+    # 3. Add GPS events
+    comms_details = consumption_data.get("communications", {}).get("details", {})
+    if "gps" in comms_details:
+        gps_details = comms_details["gps"]
+        if isinstance(gps_details, dict) and gps_details.get("average_mw"):
+            interval = int(3600 * 24 / gps_details.get("updates", 24))  # Fallback to hourly if no updates specified
+            duration = int(COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["typical_duration"])
+            
+            for t in range(0, seconds, interval):
+                if t == 0:  # First fix includes acquisition
+                    timeline[t:t + int(COMMS_CONFIGS["GPS"]["power_modes"]["acquisition"]["typical_duration"])] += \
+                        COMMS_CONFIGS["GPS"]["power_modes"]["acquisition"]["power"]
+                else:  # Regular tracking
+                    if t + duration < seconds:
+                        timeline[int(t):int(t + duration)] += COMMS_CONFIGS["GPS"]["power_modes"]["tracking"]["power"]
+    
+    # 4. Add Cellular events
+    if "cellular" in comms_details:
+        cellular_details = comms_details["cellular"]
+        if isinstance(cellular_details, dict) and cellular_details.get("average_mw"):
+            # Calculate sessions based on total updates
+            sessions = cellular_details.get("sessions", 1)
+            interval = int(24 * 3600 / sessions)
+            duration = int(COMMS_CONFIGS["CELLULAR"]["default_schedule"]["duration"] * 60)  # Convert minutes to seconds
+            
+            for t in range(0, seconds, interval):
+                if t + duration < seconds:
+                    # Add startup spike
+                    timeline[t] += COMMS_CONFIGS["CELLULAR"]["power_modes"]["startup"]["power"]
+                    # Add transmission window
+                    timeline[t+1:t+duration] += COMMS_CONFIGS["CELLULAR"]["power_modes"]["active"]["power"]
+    
+    # 5. Add LoRa events
+    if "lora" in comms_details:
+        lora_details = comms_details["lora"]
+        if isinstance(lora_details, dict) and lora_details.get("average_mw"):
+            messages = lora_details.get("messages", 24)  # Default to hourly
+            interval = int(24 * 3600 / messages)
+            duration = int(COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["typical_duration"])
+            
+            for t in range(0, seconds, interval):
+                if t + duration < seconds:
+                    timeline[t:t+duration] += COMMS_CONFIGS["LORA"]["power_modes"]["tx"]["power"]
+            
+            # Add listening power if enabled
+            if lora_details.get("rx_enabled", False):
+                rx_power = COMMS_CONFIGS["LORA"]["power_modes"]["rx"]["power"]
+                timeline += rx_power * lora_details.get("rx_duty_cycle", 0.1)
+    
+    # 6. Add Coprocessor events
+    if consumption_data["coprocessor"].get("total", 0) > 0:
+        coprocessor_details = consumption_data["coprocessor"].get("details", {})
+        if isinstance(coprocessor_details, dict):
+            windows = coprocessor_details.get("windows", 1)
+            interval = int(24 * 3600 / windows)
+            duration = int(coprocessor_details.get("active_mwh", 0) / coprocessor_details.get("average_mw", 1) * 3600)
+            
+            for t in range(0, seconds, interval):
+                if t + duration < seconds:
+                    timeline[t:t+duration] += coprocessor_details.get("average_mw", 0)
+    
+    return timeline
+
 def plot_battery_life(daily_consumption_mwh, target_batteries=[77.0, 100.7]):
-    """Create enhanced battery life visualization."""
+    """Create enhanced battery life visualization with accurate power profile."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12), height_ratios=[2, 1])
     
     # Plot 1: Battery Life Curve
@@ -809,25 +899,37 @@ def plot_battery_life(daily_consumption_mwh, target_batteries=[77.0, 100.7]):
     ax1.grid(True)
     ax1.legend()
 
-    # Plot 2: Daily Power Profile
-    hours = np.arange(24)
-    
-    # Example power profile (you would calculate this from your consumption data)
-    def power_profile(consumption_data, hour):
-        base_power = consumption_data["average_power_mw"]
-        # Add variations based on communications schedule
-        variation = 0
-        if 'cellular' in consumption_data["communications"]["details"]:
-            cellular = consumption_data["communications"]["details"]["cellular"]
-            if hour == 1:  # Assuming cellular transmits at 1 AM
-                variation += cellular["average_mw"] * 4
-        return base_power + variation
-    
-    power_profile = [power_profile(st.session_state.last_calculation, hour) for hour in hours]
-    
-    ax2.bar(hours, power_profile, color='skyblue', alpha=0.6)
-    ax2.axhline(y=st.session_state.last_calculation["average_power_mw"], 
-                color='r', linestyle='--', label='Average Power')
+    # Plot 2: Daily Power Profile - Using the improved timeline calculation
+    try:
+        timeline = calculate_power_timeline(st.session_state.last_calculation)
+        
+        # Convert timeline to hourly averages for clearer visualization
+        hours = np.arange(24)
+        hourly_power = np.array([np.mean(timeline[i*3600:(i+1)*3600]) for i in range(24)])
+        
+        # Plot the hourly power
+        ax2.plot(hours, hourly_power, 'b-', label='Power Profile')
+        
+        # Add average line
+        avg_power = np.mean(hourly_power)
+        ax2.axhline(y=avg_power, color='r', linestyle='--', 
+                   label=f'Average ({avg_power:.1f} mW)')
+        
+        # Add min/max annotations
+        max_power = np.max(hourly_power)
+        min_power = np.min(hourly_power)
+        ax2.annotate(f'Peak: {max_power:.1f} mW', 
+                    xy=(hours[np.argmax(hourly_power)], max_power),
+                    xytext=(5, 5), textcoords='offset points')
+        ax2.annotate(f'Min: {min_power:.1f} mW',
+                    xy=(hours[np.argmin(hourly_power)], min_power),
+                    xytext=(5, -15), textcoords='offset points')
+        
+    except Exception as e:
+        # Fallback to simple average power display if timeline calculation fails
+        hours = np.arange(24)
+        avg_power = st.session_state.last_calculation["average_power_mw"]
+        ax2.plot(hours, [avg_power] * 24, 'b-', label='Average Power')
     
     ax2.set_xlabel('Hour of Day')
     ax2.set_ylabel('Power Draw (mW)')
@@ -982,24 +1084,129 @@ def display_results(consumption_data, battery_config):
     
     with tab3:
         st.subheader("24-Hour Power Profile")
-        col1, col2 = st.columns([3, 1])
         
-        with col1:
-            # Display the profile plot here
+        try:
+            # Calculate detailed timeline
+            timeline = calculate_power_timeline(consumption_data)
+            
+            # Convert to hourly averages
+            hours = np.arange(24)
+            hourly_power = np.array([np.mean(timeline[i*3600:(i+1)*3600]) for i in range(24)])
+            
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                # Create main power profile plot
+                fig_profile = plt.figure(figsize=(12, 8))
+                plt.subplot(2, 1, 1)
+                
+                # Plot hourly averages as bars
+                plt.bar(hours, hourly_power, alpha=0.5, color='skyblue', label='Hourly Average')
+                plt.axhline(y=consumption_data["average_power_mw"], 
+                          color='r', linestyle='--', 
+                          label=f'Daily Average ({consumption_data["average_power_mw"]:.1f} mW)')
+                
+                plt.xlabel('Hour of Day')
+                plt.ylabel('Power Draw (mW)')
+                plt.title('Hourly Average Power Profile')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                
+                # Add detailed timeline subplot
+                plt.subplot(2, 1, 2)
+                detailed_minutes = np.arange(24*60) / 60  # X-axis in hours
+                minute_averages = np.array([np.mean(timeline[i*60:(i+1)*60]) 
+                                          for i in range(24*60)])
+                
+                plt.plot(detailed_minutes, minute_averages, 
+                        linewidth=1, alpha=0.7, color='blue',
+                        label='Minute-by-Minute')
+                plt.axhline(y=consumption_data["average_power_mw"], 
+                          color='r', linestyle='--', 
+                          label='Daily Average')
+                
+                plt.xlabel('Hour of Day')
+                plt.ylabel('Power Draw (mW)')
+                plt.title('Detailed Power Profile (1-Minute Resolution)')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                
+                plt.tight_layout()
+                st.pyplot(fig_profile)
+            
+            with col2:
+                st.write("Power Statistics:")
+                st.write("---")
+                
+                # Calculate statistics
+                peak_power = np.max(minute_averages)
+                min_power = np.min(minute_averages)
+                avg_power = np.mean(minute_averages)
+                
+                st.write(f"Peak Power: {peak_power:.2f} mW")
+                st.write(f"Minimum Power: {min_power:.2f} mW")
+                st.write(f"Average Power: {avg_power:.2f} mW")
+                st.write("---")
+                
+                # Add active times
+                st.write("Active Periods:")
+                if consumption_data["communications"]["details"].get("cellular"):
+                    cellular = consumption_data["communications"]["details"]["cellular"]
+                    st.write(f"Cellular: {cellular.get('sessions', 0):.1f} times per day")
+                
+                if consumption_data["communications"]["details"].get("gps"):
+                    gps = consumption_data["communications"]["details"]["gps"]
+                    st.write(f"GPS: {gps.get('updates', 0):.1f} updates per day")
+                
+                if consumption_data["communications"]["details"].get("lora"):
+                    lora = consumption_data["communications"]["details"]["lora"]
+                    st.write(f"LoRa: {lora.get('messages', 0):.1f} messages per day")
+                
+                if consumption_data["coprocessor"]["total"] > 0:
+                    coprocessor = consumption_data["coprocessor"]["details"]
+                    st.write(f"Co-Processor: {coprocessor.get('windows', 0):.1f} windows per day")
+                
+                st.write("---")
+                
+                # Add power distribution
+                st.write("Power Contribution:")
+                total_power = consumption_data["average_power_mw"]
+                if total_power > 0:
+                    if consumption_data["sensors"]["continuous"] > 0:
+                        sensor_cont_pct = (consumption_data["sensors"]["continuous"]/24) / total_power * 100
+                        st.write(f"Continuous Sensors: {sensor_cont_pct:.1f}%")
+                    
+                    if consumption_data["sensors"]["polled"] > 0:
+                        sensor_poll_pct = (consumption_data["sensors"]["polled"]/24) / total_power * 100
+                        st.write(f"Polled Sensors: {sensor_poll_pct:.1f}%")
+                    
+                    if consumption_data["communications"]["total"] > 0:
+                        comms_pct = (consumption_data["communications"]["total"]/24) / total_power * 100
+                        st.write(f"Communications: {comms_pct:.1f}%")
+                    
+                    if consumption_data["coprocessor"]["total"] > 0:
+                        coproc_pct = (consumption_data["coprocessor"]["total"]/24) / total_power * 100
+                        st.write(f"Co-Processor: {coproc_pct:.1f}%")
+        
+        except Exception as e:
+            st.error("Unable to generate detailed power profile. Using average power only.")
+            
+            # Fallback to simple average display
             fig_profile = plt.figure(figsize=(10, 6))
             hours = np.arange(24)
-            power_profile = [consumption_data["average_power_mw"]] * 24  # Simplified
-            plt.plot(hours, power_profile, 'b-')
+            power_profile = [consumption_data["average_power_mw"]] * 24
+            plt.plot(hours, power_profile, 'b-', label='Average Power')
             plt.xlabel('Hour of Day')
             plt.ylabel('Power Draw (mW)')
+            plt.title('24-Hour Average Power Profile')
             plt.grid(True)
+            plt.legend()
             st.pyplot(fig_profile)
-        
-        with col2:
-            st.write("Peak Power:")
-            st.write(f"{max(power_profile):.2f} mW")
-            st.write("Minimum Power:")
-            st.write(f"{min(power_profile):.2f} mW")
+            
+            with col2:
+                st.write("Power Statistics:")
+                st.write("---")
+                st.write(f"Average Power: {consumption_data['average_power_mw']:.2f} mW")
 
     # Power optimization recommendations
     st.header("Optimization Recommendations")
